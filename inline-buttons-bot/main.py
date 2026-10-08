@@ -4,8 +4,10 @@
 * Человек нажимает /start — бот запоминает его. Бот может писать только тем, кто
   уже писал ему (это правило Telegram), поэтому получатели сначала нажимают /start.
 * Админ (ID из ADMIN_IDS) присылает боту пост — текст, фото, видео, что угодно,
-  затем кнопки. Бот показывает предпросмотр и спрашивает: всем подписчикам или одному.
-* Пост копируется каждому получателю вместе с кнопками.
+  затем кнопки. Бот показывает предпросмотр и предлагает: отправить всем подписчикам,
+  одному человеку или сохранить пост для inline-режима.
+* Сохранённый пост админ отправляет из любого чата: пишет @бота и выбирает пост.
+  Такое сообщение уходит от аккаунта админа, с кнопками.
 
 Бот работает через long polling и клиент Bot API из telegram_api.py.
 aiogram здесь не используется: он занимает ~165 МБ памяти только на импорт.
@@ -26,6 +28,7 @@ from dotenv import load_dotenv
 
 from buttons import ButtonSpec, ButtonsParseError, build_markup, parse_buttons, popup_id_from_callback
 from db import Database
+from posts import RESULTS_LIMIT, Content, extract_content, inline_result, make_title
 from telegram_api import (
     POLL_TIMEOUT,
     BadRequestError,
@@ -41,13 +44,15 @@ from telegram_api import (
 BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger("bot")
 
+# Какие обновления просим у Telegram. Без inline_query бот не увидит @-запросы.
+ALLOWED_UPDATES = ("message", "callback_query", "inline_query")
 # Пауза между отправками при рассылке: около 20 сообщений в секунду, с запасом до лимита Telegram.
 SEND_INTERVAL = 0.05
 # Сколько раз пробовать отправить одно сообщение (лимиты Telegram и сетевые сбои).
 MAX_ATTEMPTS = 3
 # Если столько получателей подряд получили непонятную ошибку, рассылку останавливаем.
 ABORT_AFTER_ERRORS = 25
-DECISIONS = ("post:all", "post:one", "post:cancel")
+DECISIONS = ("post:all", "post:one", "post:save", "post:cancel")
 
 # ---------------------------------------------------------------- тексты
 
@@ -58,15 +63,20 @@ ADMIN_GREETING = "Привет, админ! Бот готов к рассылк�
 ADMIN_HELP = """Как отправить пост с кнопками:
 1. Пришли пост: текст, фото, видео или любое другое сообщение. Жирный шрифт и ссылки сохранятся.
 2. Пришли кнопки или /skip, если кнопки не нужны.
-3. Проверь предпросмотр и выбери, кому отправить.
+3. Проверь предпросмотр и выбери: всем подписчикам, одному человеку или «Сохранить для инлайна».
 
 Формат кнопок (каждая строка — отдельный ряд, кнопки в ряду разделяй «|»):
 Текст кнопки - https://ссылка
 Текст 1 - https://ссылка1 | Текст 2 - https://ссылка2
 Текст кнопки - popup: текст во всплывающем окне (до 200 символов)
 
+Сохранённый пост отправляется из любого чата: напиши в нём @бот и выбери пост из списка.
+
 Команды:
 /cancel — отменить текущий пост
+/skip — пост без кнопок
+/posts — сохранённые посты
+/delpost <номер> — удалить сохранённый пост
 /stats — статистика подписчиков
 /id — твой ID
 /help — эта справка"""
@@ -94,6 +104,12 @@ STALE = "Этот пост уже неактуален. Пришли пост з
 DRAFT_MISSING = "Черновик не найден (возможно, его удалили). Пришли пост заново."
 POPUP_MISSING = "Это окно больше недоступно."
 UNKNOWN_COMMAND = "Не понял команду. Список команд — /help."
+UNSUPPORTED_FOR_INLINE = (
+    "Этот тип сообщения нельзя сохранить для инлайн-режима. "
+    "Можно текст, фото, видео, GIF, файл, аудио и голосовое."
+)
+NO_SAVED_POSTS = "Сохранённых постов пока нет. Подготовь пост и выбери «💾 Сохранить для инлайна»."
+DELPOST_USAGE = "Укажи номер поста: /delpost 3. Номера смотри в /posts."
 
 
 # ---------------------------------------------------------------- настройки
@@ -137,6 +153,7 @@ class Flow:
 
     step: str  # "buttons" — ждём кнопки; "choose" — ждём выбор; "target" — ждём получателя
     source_message_id: int  # id черновика в чате с админом
+    content: Content | None = None  # для inline-режима; None — тип не поддерживается
     markup: dict[str, Any] | None = None
 
 
@@ -148,6 +165,7 @@ class App:
     db: Database
     api: Any  # TelegramAPI; в тестах подменяется заглушкой
     flows: dict[int, Flow] = field(default_factory=dict)
+    bot_username: str | None = None  # без «@»; заполняется при запуске через getMe
 
 
 @dataclass(frozen=True)
@@ -159,6 +177,7 @@ class IncomingMessage:
     username: str | None
     first_name: str | None
     text: str | None
+    content: Content | None  # что можно сохранить для inline-режима
 
 
 @dataclass(frozen=True)
@@ -166,8 +185,15 @@ class IncomingPress:
     callback_id: str
     user_id: int
     data: str | None
-    chat_id: int | None
+    chat_id: int | None  # под сообщениями, отправленными через inline, чата нет
     message_id: int | None
+
+
+@dataclass(frozen=True)
+class IncomingInlineQuery:
+    id: str
+    user_id: int
+    text: str
 
 
 def parse_message(raw: dict[str, Any]) -> IncomingMessage:
@@ -181,6 +207,7 @@ def parse_message(raw: dict[str, Any]) -> IncomingMessage:
         username=sender.get("username"),
         first_name=sender.get("first_name"),
         text=raw.get("text"),
+        content=extract_content(raw),
     )
 
 
@@ -195,12 +222,22 @@ def parse_press(raw: dict[str, Any]) -> IncomingPress:
     )
 
 
+def parse_inline(raw: dict[str, Any]) -> IncomingInlineQuery:
+    return IncomingInlineQuery(id=raw["id"], user_id=raw["from"]["id"], text=raw.get("query", ""))
+
+
 def parse_command(text: str | None) -> str | None:
     """Имя команды без «/» и без «@бота»: '/start@my_bot arg' -> 'start'. Не команда — None."""
     if not text or not text.startswith("/"):
         return None
     head = text.split(maxsplit=1)[0]
     return head[1:].split("@", 1)[0].lower()
+
+
+def command_args(text: str | None) -> str:
+    """Текст после команды: '/delpost 3' -> '3'."""
+    parts = (text or "").split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
 
 
 def is_admin(app: App, user_id: int) -> bool:
@@ -234,16 +271,24 @@ async def edit(app: App, press: IncomingPress, text: str) -> None:
         logger.info("Не удалось изменить сообщение: %s", exc.description)
 
 
-def decision_keyboard(recipients: int) -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [{"text": f"📢 Всем подписчикам ({recipients})", "callback_data": "post:all"}],
-            [
-                {"text": "👤 Одному человеку", "callback_data": "post:one"},
-                {"text": "✖ Отмена", "callback_data": "post:cancel"},
-            ],
-        ]
-    }
+def decision_keyboard(recipients: int, can_save: bool) -> dict[str, Any]:
+    rows: list[list[dict[str, str]]] = [
+        [{"text": f"📢 Всем подписчикам ({recipients})", "callback_data": "post:all"}],
+        [{"text": "👤 Одному человеку", "callback_data": "post:one"}],
+    ]
+    if can_save:
+        rows.append([{"text": "💾 Сохранить для инлайна", "callback_data": "post:save"}])
+    rows.append([{"text": "✖ Отмена", "callback_data": "post:cancel"}])
+    return {"inline_keyboard": rows}
+
+
+def saved_text(post_id: int, bot_username: str | None) -> str:
+    where = f"@{bot_username}" if bot_username else "юзернейм бота (его подскажет @BotFather)"
+    return (
+        f"💾 Пост №{post_id} сохранён.\n"
+        f"Чтобы отправить его человеку: открой чат с ним, напиши {where} "
+        "и выбери пост из списка. Сохранённые посты — /posts."
+    )
 
 
 # ---------------------------------------------------------------- команды пользователей
@@ -292,9 +337,30 @@ async def cmd_stats(app: App, msg: IncomingMessage) -> None:
     )
 
 
+async def cmd_posts(app: App, msg: IncomingMessage) -> None:
+    posts = app.db.list_prepared(limit=RESULTS_LIMIT)
+    if not posts:
+        await send(app, msg.chat_id, NO_SAVED_POSTS)
+        return
+    lines = [f"№{post.post_id} · {post.title}" for post in posts]
+    await send(app, msg.chat_id, "Сохранённые посты (удалить: /delpost <номер>):\n" + "\n".join(lines))
+
+
+async def cmd_delpost(app: App, msg: IncomingMessage) -> None:
+    raw = command_args(msg.text)
+    if not raw.isdigit():
+        await send(app, msg.chat_id, DELPOST_USAGE)
+        return
+    post_id = int(raw)
+    if app.db.delete_prepared(post_id):
+        await send(app, msg.chat_id, f"🗑 Пост №{post_id} удалён.")
+    else:
+        await send(app, msg.chat_id, f"Поста №{post_id} нет. Номера смотри в /posts.")
+
+
 async def start_draft(app: App, msg: IncomingMessage) -> None:
     """Любое сообщение админа без активного шага становится черновиком поста."""
-    app.flows[msg.user_id] = Flow(step="buttons", source_message_id=msg.message_id)
+    app.flows[msg.user_id] = Flow(step="buttons", source_message_id=msg.message_id, content=msg.content)
     await send(app, msg.chat_id, DRAFT_SAVED)
 
 
@@ -334,7 +400,12 @@ async def show_preview(
     flow.markup = markup
     flow.step = "choose"
     recipients = len(app.db.subscriber_ids(app.config.admin_ids))
-    await send(app, msg.chat_id, PREVIEW_QUESTION, reply_markup=decision_keyboard(recipients))
+    await send(
+        app,
+        msg.chat_id,
+        PREVIEW_QUESTION,
+        reply_markup=decision_keyboard(recipients, can_save=flow.content is not None),
+    )
 
 
 async def target_received(app: App, msg: IncomingMessage, flow: Flow) -> None:
@@ -371,6 +442,12 @@ async def admin_message(app: App, msg: IncomingMessage, command: str | None) -> 
         return True
     if command == "stats":
         await cmd_stats(app, msg)
+        return True
+    if command == "posts":
+        await cmd_posts(app, msg)
+        return True
+    if command == "delpost":
+        await cmd_delpost(app, msg)
         return True
     if command == "skip" and flow is not None and flow.step == "buttons":
         await show_preview(app, msg, flow, rows=[])
@@ -434,24 +511,40 @@ async def handle_decision(app: App, press: IncomingPress, flow: Flow, data: str)
         flow.step = "target"
         await answer(app, press)
         await edit(app, press, TARGET_QUESTION)
+    elif data == "post:save":
+        await save_for_inline(app, press, flow)
     else:  # post:all
-        # Состояние сбрасываем до любых ожиданий: повторное нажатие уже не запустит рассылку.
-        app.flows.pop(press.user_id, None)
-        await answer(app, press)
-        recipients = app.db.subscriber_ids(app.config.admin_ids)
-        if not recipients:
-            await edit(app, press, "Некому отправить: подписчиков пока нет.")
-            return
-        await edit(app, press, f"🚀 Рассылка запущена: получателей {len(recipients)}. Отчёт пришлю в конце.")
-        start_background(
-            run_broadcast(
-                app,
-                admin_chat_id=press.user_id,
-                source_message_id=flow.source_message_id,
-                markup=flow.markup,
-                recipients=recipients,
-            )
+        await start_broadcast(app, press, flow)
+
+
+async def save_for_inline(app: App, press: IncomingPress, flow: Flow) -> None:
+    if flow.content is None:
+        await answer(app, press, UNSUPPORTED_FOR_INLINE, alert=True)
+        return
+    app.flows.pop(press.user_id, None)
+    post_id = app.db.add_prepared(make_title(flow.content), flow.content, flow.markup)
+    await answer(app, press)
+    await edit(app, press, saved_text(post_id, app.bot_username))
+
+
+async def start_broadcast(app: App, press: IncomingPress, flow: Flow) -> None:
+    # Состояние сбрасываем до любых ожиданий: повторное нажатие уже не запустит рассылку.
+    app.flows.pop(press.user_id, None)
+    await answer(app, press)
+    recipients = app.db.subscriber_ids(app.config.admin_ids)
+    if not recipients:
+        await edit(app, press, "Некому отправить: подписчиков пока нет.")
+        return
+    await edit(app, press, f"🚀 Рассылка запущена: получателей {len(recipients)}. Отчёт пришлю в конце.")
+    start_background(
+        run_broadcast(
+            app,
+            admin_chat_id=press.user_id,
+            source_message_id=flow.source_message_id,
+            markup=flow.markup,
+            recipients=recipients,
         )
+    )
 
 
 async def popup_pressed(app: App, press: IncomingPress) -> None:
@@ -476,11 +569,31 @@ async def handle_press(app: App, press: IncomingPress) -> None:
         await popup_pressed(app, press)
 
 
+async def handle_inline(app: App, query: IncomingInlineQuery) -> None:
+    """@бот в любом чате: админ видит свои сохранённые посты, остальные — пустой список."""
+    admin = is_admin(app, query.user_id)
+    posts = app.db.list_prepared(query=query.text, limit=RESULTS_LIMIT) if admin else []
+    results = [inline_result(post) for post in posts]
+    button = None
+    if admin and not results:
+        button = {"text": "Подготовить пост", "start_parameter": "prepare"}
+    await app.api.call(
+        "answerInlineQuery",
+        inline_query_id=query.id,
+        results=results,
+        cache_time=0,
+        is_personal=True,
+        button=button,
+    )
+
+
 async def handle_update(app: App, update: dict[str, Any]) -> None:
     if "message" in update:
         await handle_message(app, parse_message(update["message"]))
     elif "callback_query" in update:
         await handle_press(app, parse_press(update["callback_query"]))
+    elif "inline_query" in update:
+        await handle_inline(app, parse_inline(update["inline_query"]))
 
 
 # ---------------------------------------------------------------- рассылка
@@ -625,15 +738,14 @@ async def wait_for_background() -> None:
 # ---------------------------------------------------------------- получение обновлений и запуск
 
 
-async def clear_webhook(api: TelegramAPI) -> None:
-    """Отключить webhook: при long polling он мешает. Сетевые сбои повторяем, а не падаем."""
+async def call_with_retries(api: TelegramAPI, method: str, **params: Any) -> Any:
+    """Вызов метода с повтором при сетевых сбоях: при старте бот не должен падать из-за сети."""
     delay = 1.0
     while True:
         try:
-            await api.call("deleteWebhook")
-            return
+            return await api.call(method, **params)
         except NetworkError:
-            logger.warning("Нет связи с Telegram, повторю через %s с", delay)
+            logger.warning("Нет связи с Telegram, повторю %s через %s с", method, delay)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
 
@@ -648,7 +760,7 @@ async def poll(app: App) -> None:
                 "getUpdates",
                 offset=offset,
                 timeout=POLL_TIMEOUT,
-                allowed_updates=["message", "callback_query"],
+                allowed_updates=list(ALLOWED_UPDATES),
                 http_timeout=POLL_TIMEOUT + 20,
             )
             delay = 1.0
@@ -686,8 +798,16 @@ async def run(config: Config) -> None:
             "Напиши боту /id и добавь полученное число в ADMIN_IDS."
         )
     try:
-        await clear_webhook(api)
-        logger.info("Бот запущен. База данных: %s", config.db_path)
+        await call_with_retries(api, "deleteWebhook")
+        me = await call_with_retries(api, "getMe")
+        app.bot_username = me.get("username")
+        if not me.get("supports_inline_queries"):
+            logger.warning(
+                "Инлайн-режим выключен: сохранённые посты не появятся в @%s. "
+                "Включи его командой /setinline в @BotFather.",
+                app.bot_username,
+            )
+        logger.info("Бот @%s запущен. База данных: %s", app.bot_username, config.db_path)
         await poll(app)
     finally:
         await api.close()

@@ -1,9 +1,13 @@
-"""Хранилище SQLite: подписчики бота и тексты всплывающих окон (popup)."""
+"""Хранилище SQLite: подписчики, тексты popup-окон и сохранённые посты для inline-режима."""
 
+import json
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from posts import Content, PreparedPost
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -15,6 +19,15 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS popups (
     id    INTEGER PRIMARY KEY AUTOINCREMENT,
     text  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS prepared_posts (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    title     TEXT NOT NULL,
+    kind      TEXT NOT NULL,
+    text      TEXT,
+    entities  TEXT,
+    file_id   TEXT,
+    markup    TEXT
 );
 """
 
@@ -34,6 +47,29 @@ def _to_user(row: sqlite3.Row) -> User:
         first_name=row["first_name"],
         subscribed=bool(row["subscribed"]),
     )
+
+
+def _to_post(row: sqlite3.Row) -> PreparedPost:
+    content = Content(
+        kind=row["kind"],
+        text=row["text"],
+        entities=_load(row["entities"]),
+        file_id=row["file_id"],
+    )
+    return PreparedPost(
+        post_id=row["id"],
+        title=row["title"],
+        content=content,
+        markup=_load(row["markup"]),
+    )
+
+
+def _dump(value: Any) -> str | None:
+    return json.dumps(value, ensure_ascii=False) if value is not None else None
+
+
+def _load(text: str | None) -> Any:
+    return json.loads(text) if text else None
 
 
 class Database:
@@ -115,3 +151,27 @@ class Database:
     def get_popup(self, popup_id: int) -> str | None:
         row = self._conn.execute("SELECT text FROM popups WHERE id = ?", (popup_id,)).fetchone()
         return row["text"] if row else None
+
+    def add_prepared(self, title: str, content: Content, markup: dict[str, Any] | None) -> int:
+        """Сохранить пост для inline-режима. Возвращает его номер."""
+        cursor = self._conn.execute(
+            "INSERT INTO prepared_posts (title, kind, text, entities, file_id, markup) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (title, content.kind, content.text, _dump(content.entities), content.file_id, _dump(markup)),
+        )
+        self._conn.commit()
+        return int(cursor.lastrowid)
+
+    def list_prepared(self, query: str = "", limit: int = 50) -> list[PreparedPost]:
+        """Сохранённые посты, новые первыми. query — поиск по названию без учёта регистра."""
+        rows = self._conn.execute("SELECT * FROM prepared_posts ORDER BY id DESC").fetchall()
+        posts = [_to_post(row) for row in rows]
+        needle = query.strip().lower()
+        if needle:
+            posts = [post for post in posts if needle in post.title.lower()]
+        return posts[:limit]
+
+    def delete_prepared(self, post_id: int) -> bool:
+        cursor = self._conn.execute("DELETE FROM prepared_posts WHERE id = ?", (post_id,))
+        self._conn.commit()
+        return cursor.rowcount > 0
