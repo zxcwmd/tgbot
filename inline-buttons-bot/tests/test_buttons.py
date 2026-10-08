@@ -2,8 +2,6 @@
 
 import unittest
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
 from buttons import (
     CALLBACK_PREFIX,
     POPUP_MAX_LENGTH,
@@ -97,14 +95,14 @@ class BuildMarkupTests(unittest.TestCase):
         self.assertEqual(saved, ["Текст окна"])
         self.assertEqual(
             markup,
-            InlineKeyboardMarkup(
-                inline_keyboard=[
+            {
+                "inline_keyboard": [
                     [
-                        InlineKeyboardButton(text="Сайт", url="https://example.com"),
-                        InlineKeyboardButton(text="Подробнее", callback_data="pp:1"),
+                        {"text": "Сайт", "url": "https://example.com"},
+                        {"text": "Подробнее", "callback_data": "pp:1"},
                     ]
                 ]
-            ),
+            },
         )
 
 

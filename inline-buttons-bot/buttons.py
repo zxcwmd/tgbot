@@ -14,9 +14,8 @@
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlparse
-
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 POPUP_PREFIX = "popup:"
 # Лимит Telegram на текст всплывающего окна (answerCallbackQuery.text): 0–200 символов.
@@ -96,28 +95,23 @@ def _is_url(value: str) -> bool:
 def build_markup(
     rows: Sequence[Sequence[ButtonSpec]],
     save_popup: Callable[[str], int],
-) -> InlineKeyboardMarkup:
-    """Собрать inline-клавиатуру.
+) -> dict[str, Any]:
+    """Собрать inline-клавиатуру в формате Telegram (InlineKeyboardMarkup).
 
     save_popup сохраняет текст всплывающего окна и возвращает его id;
     по нажатию кнопки бот найдёт текст по этому id.
     """
-    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard: list[list[dict[str, str]]] = []
     for row in rows:
-        buttons: list[InlineKeyboardButton] = []
+        buttons: list[dict[str, str]] = []
         for spec in row:
             if spec.url is not None:
-                buttons.append(InlineKeyboardButton(text=spec.label, url=spec.url))
+                buttons.append({"text": spec.label, "url": spec.url})
             else:
                 popup_id = save_popup(spec.popup or "")
-                buttons.append(
-                    InlineKeyboardButton(
-                        text=spec.label,
-                        callback_data=f"{CALLBACK_PREFIX}{popup_id}",
-                    )
-                )
+                buttons.append({"text": spec.label, "callback_data": f"{CALLBACK_PREFIX}{popup_id}"})
         keyboard.append(buttons)
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+    return {"inline_keyboard": keyboard}
 
 
 def popup_id_from_callback(data: str | None) -> int | None:

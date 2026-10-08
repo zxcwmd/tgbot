@@ -7,6 +7,9 @@
   затем кнопки. Бот показывает предпросмотр и спрашивает: всем подписчикам или одному.
 * Пост копируется каждому получателю вместе с кнопками.
 
+Бот работает через long polling и клиент Bot API из telegram_api.py.
+aiogram здесь не используется: он занимает ~165 МБ памяти только на импорт.
+
 Запуск: python main.py (настройки — см. README.md).
 """
 
@@ -14,41 +17,37 @@ import asyncio
 import logging
 import os
 import sys
-from collections.abc import Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.enums import ChatType
-from aiogram.exceptions import (
-    TelegramAPIError,
-    TelegramBadRequest,
-    TelegramForbiddenError,
-    TelegramNetworkError,
-    TelegramRetryAfter,
-)
-from aiogram.filters import BaseFilter, Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 from buttons import ButtonSpec, ButtonsParseError, build_markup, parse_buttons, popup_id_from_callback
 from db import Database
+from telegram_api import (
+    POLL_TIMEOUT,
+    BadRequestError,
+    ConflictError,
+    ForbiddenError,
+    NetworkError,
+    RetryAfterError,
+    TelegramAPI,
+    TelegramError,
+    UnauthorizedError,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger("bot")
 
-# Пауза между отправками при рассылке: около 20 сообщений в секунду.
-# Telegram допускает примерно 30 сообщений в секунду.
+# Пауза между отправками при рассылке: около 20 сообщений в секунду, с запасом до лимита Telegram.
 SEND_INTERVAL = 0.05
 # Сколько раз пробовать отправить одно сообщение (лимиты Telegram и сетевые сбои).
 MAX_ATTEMPTS = 3
 # Если столько получателей подряд получили непонятную ошибку, рассылку останавливаем.
 ABORT_AFTER_ERRORS = 25
+DECISIONS = ("post:all", "post:one", "post:cancel")
 
 # ---------------------------------------------------------------- тексты
 
@@ -129,316 +128,359 @@ def load_config() -> Config:
     return Config(token=token, admin_ids=admin_ids, db_path=db_path)
 
 
-# ---------------------------------------------------------------- состояния и фильтры
+# ---------------------------------------------------------------- состояние и входящие события
 
 
-class PostFlow(StatesGroup):
-    """Шаги создания поста админом."""
+@dataclass
+class Flow:
+    """Шаг создания поста, на котором сейчас находится админ."""
 
-    buttons = State()  # пост сохранён, ждём кнопки или /skip
-    choose = State()  # показан предпросмотр, ждём выбор получателей
-    target = State()  # ждём @username или ID для отправки одному
-
-
-class IsAdmin(BaseFilter):
-    """Пропускает только админов из ADMIN_IDS. config подставляется из диспетчера."""
-
-    async def __call__(self, event: Message | CallbackQuery, config: Config) -> bool:
-        return event.from_user is not None and event.from_user.id in config.admin_ids
+    step: str  # "buttons" — ждём кнопки; "choose" — ждём выбор; "target" — ждём получателя
+    source_message_id: int  # id черновика в чате с админом
+    markup: dict[str, Any] | None = None
 
 
-class NotCommand(BaseFilter):
-    """Пропускает всё, кроме команд вида /что-то."""
+@dataclass
+class App:
+    """Всё, что нужно обработчикам: настройки, база, клиент Bot API и шаги админов."""
 
-    async def __call__(self, message: Message) -> bool:
-        return not (message.text or "").startswith("/")
-
-
-class CallbackPrefix(BaseFilter):
-    """Пропускает нажатия кнопок, у которых callback_data начинается с prefix."""
-
-    def __init__(self, prefix: str) -> None:
-        self.prefix = prefix
-
-    async def __call__(self, callback: CallbackQuery) -> bool:
-        return bool(callback.data) and callback.data.startswith(self.prefix)
+    config: Config
+    db: Database
+    api: Any  # TelegramAPI; в тестах подменяется заглушкой
+    flows: dict[int, Flow] = field(default_factory=dict)
 
 
-class TrackUserMiddleware(BaseMiddleware):
-    """Запоминает каждого, кто написал боту в личку."""
-
-    async def __call__(self, handler: Any, event: Message, data: dict[str, Any]) -> Any:
-        user = event.from_user
-        if user is not None and event.chat.type == ChatType.PRIVATE:
-            data["db"].touch_user(user.id, user.username, user.first_name)
-        return await handler(event, data)
-
-
-# ---------------------------------------------------------------- клавиатуры
+@dataclass(frozen=True)
+class IncomingMessage:
+    chat_id: int
+    chat_type: str
+    message_id: int
+    user_id: int
+    username: str | None
+    first_name: str | None
+    text: str | None
 
 
-def decision_keyboard(recipients: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+@dataclass(frozen=True)
+class IncomingPress:
+    callback_id: str
+    user_id: int
+    data: str | None
+    chat_id: int | None
+    message_id: int | None
+
+
+def parse_message(raw: dict[str, Any]) -> IncomingMessage:
+    chat = raw["chat"]
+    sender = raw.get("from") or {}
+    return IncomingMessage(
+        chat_id=chat["id"],
+        chat_type=chat["type"],
+        message_id=raw["message_id"],
+        user_id=sender.get("id", chat["id"]),
+        username=sender.get("username"),
+        first_name=sender.get("first_name"),
+        text=raw.get("text"),
+    )
+
+
+def parse_press(raw: dict[str, Any]) -> IncomingPress:
+    message = raw.get("message") or {}
+    return IncomingPress(
+        callback_id=raw["id"],
+        user_id=raw["from"]["id"],
+        data=raw.get("data"),
+        chat_id=(message.get("chat") or {}).get("id"),
+        message_id=message.get("message_id"),
+    )
+
+
+def parse_command(text: str | None) -> str | None:
+    """Имя команды без «/» и без «@бота»: '/start@my_bot arg' -> 'start'. Не команда — None."""
+    if not text or not text.startswith("/"):
+        return None
+    head = text.split(maxsplit=1)[0]
+    return head[1:].split("@", 1)[0].lower()
+
+
+def is_admin(app: App, user_id: int) -> bool:
+    return user_id in app.config.admin_ids
+
+
+# ---------------------------------------------------------------- отправка и ответы
+
+
+async def send(app: App, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> None:
+    await app.api.call("sendMessage", chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+
+async def answer(app: App, press: IncomingPress, text: str | None = None, alert: bool = False) -> None:
+    """Ответить на нажатие кнопки. Сбой ответа не должен срывать сценарий."""
+    try:
+        await app.api.call(
+            "answerCallbackQuery", callback_query_id=press.callback_id, text=text, show_alert=alert
+        )
+    except TelegramError as exc:
+        logger.info("Не удалось ответить на нажатие кнопки: %s", exc.description)
+
+
+async def edit(app: App, press: IncomingPress, text: str) -> None:
+    """Заменить текст сообщения с кнопками. Без клавиатуры кнопки исчезают."""
+    if press.chat_id is None or press.message_id is None:
+        return
+    try:
+        await app.api.call("editMessageText", chat_id=press.chat_id, message_id=press.message_id, text=text)
+    except TelegramError as exc:
+        logger.info("Не удалось изменить сообщение: %s", exc.description)
+
+
+def decision_keyboard(recipients: int) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": f"📢 Всем подписчикам ({recipients})", "callback_data": "post:all"}],
             [
-                InlineKeyboardButton(
-                    text=f"📢 Всем подписчикам ({recipients})", callback_data="post:all"
-                )
-            ],
-            [
-                InlineKeyboardButton(text="👤 Одному человеку", callback_data="post:one"),
-                InlineKeyboardButton(text="✖ Отмена", callback_data="post:cancel"),
+                {"text": "👤 Одному человеку", "callback_data": "post:one"},
+                {"text": "✖ Отмена", "callback_data": "post:cancel"},
             ],
         ]
-    )
+    }
 
 
-def markup_from_state(data: dict[str, Any]) -> InlineKeyboardMarkup | None:
-    stored = data.get("markup")
-    return InlineKeyboardMarkup.model_validate(stored) if stored else None
+# ---------------------------------------------------------------- команды пользователей
 
 
-# ---------------------------------------------------------------- обработчики админа
+async def cmd_start(app: App, msg: IncomingMessage) -> None:
+    app.db.subscribe(msg.user_id, msg.username, msg.first_name)
+    if is_admin(app, msg.user_id):
+        await send(app, msg.chat_id, ADMIN_GREETING + ADMIN_HELP)
+    else:
+        await send(app, msg.chat_id, USER_GREETING)
 
 
-async def draft_received(message: Message, state: FSMContext) -> None:
-    """Любое сообщение админа без активного шага становится черновиком поста."""
-    await state.set_state(PostFlow.buttons)
-    await state.set_data(
-        {"admin_chat_id": message.chat.id, "source_message_id": message.message_id}
-    )
-    await message.answer(DRAFT_SAVED)
+async def cmd_stop(app: App, msg: IncomingMessage) -> None:
+    app.db.set_subscribed(msg.user_id, False)
+    await send(app, msg.chat_id, STOPPED)
 
 
-async def buttons_received(message: Message, state: FSMContext, db: Database, config: Config) -> None:
-    try:
-        rows = parse_buttons(message.text or "")
-    except ButtonsParseError as exc:
-        await message.answer(f"❌ Не получилось разобрать кнопки: {exc}\n{BUTTONS_ERROR_SUFFIX}")
+async def cmd_id(app: App, msg: IncomingMessage) -> None:
+    await send(app, msg.chat_id, f"Ваш ID: {msg.user_id}")
+
+
+async def cmd_help(app: App, msg: IncomingMessage) -> None:
+    await send(app, msg.chat_id, ADMIN_HELP if is_admin(app, msg.user_id) else USER_HINT)
+
+
+# ---------------------------------------------------------------- команды и сообщения админа
+
+
+async def cmd_cancel(app: App, msg: IncomingMessage) -> None:
+    if msg.user_id not in app.flows:
+        await send(app, msg.chat_id, NOTHING_TO_CANCEL)
         return
-    await show_preview(message, state, db, config, rows)
+    del app.flows[msg.user_id]
+    await send(app, msg.chat_id, CANCELLED)
 
 
-async def skip_buttons(message: Message, state: FSMContext, db: Database, config: Config) -> None:
-    await show_preview(message, state, db, config, rows=[])
+async def cmd_stats(app: App, msg: IncomingMessage) -> None:
+    subscribed, total = app.db.stats(exclude=app.config.admin_ids)
+    await send(
+        app,
+        msg.chat_id,
+        f"📊 Подписчиков: {subscribed}\n"
+        f"Отписались или заблокировали бота: {total - subscribed}\n"
+        f"Всего в базе: {total}",
+    )
 
 
-async def buttons_hint(message: Message) -> None:
-    await message.answer(BUTTONS_HINT)
+async def start_draft(app: App, msg: IncomingMessage) -> None:
+    """Любое сообщение админа без активного шага становится черновиком поста."""
+    app.flows[msg.user_id] = Flow(step="buttons", source_message_id=msg.message_id)
+    await send(app, msg.chat_id, DRAFT_SAVED)
+
+
+async def buttons_received(app: App, msg: IncomingMessage, flow: Flow) -> None:
+    try:
+        rows = parse_buttons(msg.text or "")
+    except ButtonsParseError as exc:
+        await send(app, msg.chat_id, f"❌ Не получилось разобрать кнопки: {exc}\n{BUTTONS_ERROR_SUFFIX}")
+        return
+    await show_preview(app, msg, flow, rows)
 
 
 async def show_preview(
-    message: Message,
-    state: FSMContext,
-    db: Database,
-    config: Config,
-    rows: list[list[ButtonSpec]],
+    app: App, msg: IncomingMessage, flow: Flow, rows: list[list[ButtonSpec]]
 ) -> None:
     """Показать админу пост с кнопками так, как его увидят получатели."""
-    data = await state.get_data()
-    admin_chat_id = data["admin_chat_id"]
-    source_message_id = data["source_message_id"]
-    markup = build_markup(rows, db.add_popup) if rows else None
+    markup = build_markup(rows, app.db.add_popup) if rows else None
     try:
-        await message.bot.copy_message(
-            chat_id=admin_chat_id,
-            from_chat_id=admin_chat_id,
-            message_id=source_message_id,
+        await app.api.call(
+            "copyMessage",
+            chat_id=msg.chat_id,
+            from_chat_id=msg.chat_id,
+            message_id=flow.source_message_id,
             reply_markup=markup,
         )
-    except TelegramBadRequest as exc:
-        if "not found" in exc.message.lower():
-            await state.clear()
-            await message.answer(DRAFT_MISSING)
+    except BadRequestError as exc:
+        if "not found" in exc.description.lower():
+            app.flows.pop(msg.user_id, None)
+            await send(app, msg.chat_id, DRAFT_MISSING)
         else:
-            await message.answer(
-                f"❌ Telegram не принял пост с этими кнопками: {exc.message}.\n{BUTTONS_ERROR_SUFFIX}"
+            await send(
+                app,
+                msg.chat_id,
+                f"❌ Telegram не принял пост с этими кнопками: {exc.description}.\n{BUTTONS_ERROR_SUFFIX}",
             )
         return
-    await state.update_data(markup=markup.model_dump(exclude_none=True) if markup else None)
-    await state.set_state(PostFlow.choose)
-    recipients = len(db.subscriber_ids(config.admin_ids))
-    await message.answer(PREVIEW_QUESTION, reply_markup=decision_keyboard(recipients))
+    flow.markup = markup
+    flow.step = "choose"
+    recipients = len(app.db.subscriber_ids(app.config.admin_ids))
+    await send(app, msg.chat_id, PREVIEW_QUESTION, reply_markup=decision_keyboard(recipients))
 
 
-async def choose_hint(message: Message) -> None:
-    await message.answer(CHOOSE_HINT)
-
-
-async def _awaiting_decision(state: FSMContext) -> bool:
-    return (await state.get_state()) == PostFlow.choose.state
-
-
-async def _answer_callback(callback: CallbackQuery, text: str | None = None, show_alert: bool = False) -> None:
-    """Ответить на нажатие кнопки. Сбой ответа не должен срывать сценарий."""
-    try:
-        await callback.answer(text, show_alert=show_alert)
-    except TelegramAPIError as exc:
-        logger.info("Не удалось ответить на нажатие кнопки: %s", exc.message)
-
-
-async def _edit_message(callback: CallbackQuery, text: str) -> None:
-    """Заменить текст сообщения с кнопками (кнопки при этом исчезают)."""
-    try:
-        await callback.message.edit_text(text)
-    except TelegramAPIError as exc:
-        logger.info("Не удалось изменить сообщение: %s", exc.message)
-
-
-async def choose_all(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db: Database,
-    config: Config,
-    bot: Bot,
-    decision_lock: asyncio.Lock,
-) -> None:
-    # Замок защищает от двойного нажатия: иначе рассылка могла бы запуститься дважды.
-    async with decision_lock:
-        if not await _awaiting_decision(state):
-            await _answer_callback(callback, STALE, show_alert=True)
-            return
-        data = await state.get_data()
-        await state.clear()
-    await _answer_callback(callback)
-    recipients = db.subscriber_ids(config.admin_ids)
-    if not recipients:
-        await _edit_message(callback, "Некому отправить: подписчиков пока нет.")
-        return
-    await _edit_message(
-        callback, f"🚀 Рассылка запущена: получателей {len(recipients)}. Отчёт пришлю в конце."
-    )
-    start_background(
-        run_broadcast(
-            bot,
-            db,
-            admin_chat_id=data["admin_chat_id"],
-            source_message_id=data["source_message_id"],
-            markup=markup_from_state(data),
-            recipients=recipients,
-        )
-    )
-
-
-async def choose_one(callback: CallbackQuery, state: FSMContext, decision_lock: asyncio.Lock) -> None:
-    async with decision_lock:
-        if not await _awaiting_decision(state):
-            await _answer_callback(callback, STALE, show_alert=True)
-            return
-        await state.set_state(PostFlow.target)
-    await _answer_callback(callback)
-    await _edit_message(callback, TARGET_QUESTION)
-
-
-async def choose_cancel(callback: CallbackQuery, state: FSMContext, decision_lock: asyncio.Lock) -> None:
-    async with decision_lock:
-        if not await _awaiting_decision(state):
-            await _answer_callback(callback, STALE, show_alert=True)
-            return
-        await state.clear()
-    await _answer_callback(callback)
-    await _edit_message(callback, CANCELLED)
-
-
-async def stale_post(callback: CallbackQuery) -> None:
-    """Нажата кнопка старого поста (например, после перезапуска бота)."""
-    await _answer_callback(callback, STALE, show_alert=True)
-
-
-async def target_received(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
-    raw = (message.text or "").strip()
+async def target_received(app: App, msg: IncomingMessage, flow: Flow) -> None:
+    raw = (msg.text or "").strip()
     if raw.startswith("@") and len(raw) > 1:
-        user = db.find_by_username(raw[1:])
+        user = app.db.find_by_username(raw[1:])
         if user is None:
-            await message.answer(TARGET_NOT_FOUND)
+            await send(app, msg.chat_id, TARGET_NOT_FOUND)
             return
         user_id = user.user_id
     elif raw.isdigit():
         user_id = int(raw)
-        user = db.get_user(user_id)  # если человека нет в базе, всё равно попробуем отправить
+        user = app.db.get_user(user_id)  # если человека нет в базе, всё равно попробуем отправить
     else:
-        await message.answer(TARGET_HINT)
+        await send(app, msg.chat_id, TARGET_HINT)
         return
     if user is not None and not user.subscribed:
-        await message.answer(TARGET_UNSUBSCRIBED)
+        await send(app, msg.chat_id, TARGET_UNSUBSCRIBED)
         return
-    data = await state.get_data()
-    await state.clear()
-    delivery = await copy_to(
-        bot,
-        user_id,
-        source_chat_id=data["admin_chat_id"],
-        source_message_id=data["source_message_id"],
-        markup=markup_from_state(data),
-    )
-    apply_outcome(db, user_id, delivery)
+    app.flows.pop(msg.user_id, None)
+    delivery = await copy_to(app.api, user_id, msg.chat_id, flow.source_message_id, flow.markup)
+    apply_outcome(app.db, user_id, delivery)
     if delivery.outcome is Outcome.SENT:
-        await message.answer(f"✅ Отправлено: {raw}.")
+        await send(app, msg.chat_id, f"✅ Отправлено: {raw}.")
     else:
-        await message.answer(f"❌ Не получилось отправить {raw}: {delivery.error}.")
+        await send(app, msg.chat_id, f"❌ Не получилось отправить {raw}: {delivery.error}.")
 
 
-async def target_hint(message: Message) -> None:
-    await message.answer(TARGET_HINT)
+async def admin_message(app: App, msg: IncomingMessage, command: str | None) -> bool:
+    """Сообщения админа. Возвращает True, если сообщение обработано."""
+    flow = app.flows.get(msg.user_id)
+    if command == "cancel":
+        await cmd_cancel(app, msg)
+        return True
+    if command == "stats":
+        await cmd_stats(app, msg)
+        return True
+    if command == "skip" and flow is not None and flow.step == "buttons":
+        await show_preview(app, msg, flow, rows=[])
+        return True
+    if command is not None:
+        return False  # остальные команды обработают пользовательские обработчики
+    if flow is None:
+        await start_draft(app, msg)
+        return True
+    if flow.step == "buttons":
+        if msg.text is not None:
+            await buttons_received(app, msg, flow)
+        else:
+            await send(app, msg.chat_id, BUTTONS_HINT)
+        return True
+    if flow.step == "target":
+        if msg.text is not None:
+            await target_received(app, msg, flow)
+        else:
+            await send(app, msg.chat_id, TARGET_HINT)
+        return True
+    await send(app, msg.chat_id, CHOOSE_HINT)  # шаг "choose"
+    return True
 
 
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    if await state.get_state() is None:
-        await message.answer(NOTHING_TO_CANCEL)
+# ---------------------------------------------------------------- маршрутизация
+
+
+async def user_message(app: App, msg: IncomingMessage, command: str | None) -> bool:
+    handlers = {"start": cmd_start, "stop": cmd_stop, "id": cmd_id, "help": cmd_help}
+    handler = handlers.get(command or "")
+    if handler is None:
+        return False
+    await handler(app, msg)
+    return True
+
+
+async def fallback(app: App, msg: IncomingMessage) -> None:
+    text = UNKNOWN_COMMAND if is_admin(app, msg.user_id) else USER_HINT
+    await send(app, msg.chat_id, text)
+
+
+async def handle_message(app: App, msg: IncomingMessage) -> None:
+    if msg.chat_type != "private":
+        return  # бот работает только в личных сообщениях
+    app.db.touch_user(msg.user_id, msg.username, msg.first_name)
+    command = parse_command(msg.text)
+    if is_admin(app, msg.user_id) and await admin_message(app, msg, command):
         return
-    await state.clear()
-    await message.answer(CANCELLED)
+    if await user_message(app, msg, command):
+        return
+    await fallback(app, msg)
 
 
-async def cmd_stats(message: Message, db: Database, config: Config) -> None:
-    subscribed, total = db.stats(exclude=config.admin_ids)
-    await message.answer(
-        f"📊 Подписчиков: {subscribed}\n"
-        f"Отписались или заблокировали бота: {total - subscribed}\n"
-        f"Всего в базе: {total}"
-    )
+async def handle_decision(app: App, press: IncomingPress, flow: Flow, data: str) -> None:
+    if data == "post:cancel":
+        app.flows.pop(press.user_id, None)
+        await answer(app, press)
+        await edit(app, press, CANCELLED)
+    elif data == "post:one":
+        flow.step = "target"
+        await answer(app, press)
+        await edit(app, press, TARGET_QUESTION)
+    else:  # post:all
+        # Состояние сбрасываем до любых ожиданий: повторное нажатие уже не запустит рассылку.
+        app.flows.pop(press.user_id, None)
+        await answer(app, press)
+        recipients = app.db.subscriber_ids(app.config.admin_ids)
+        if not recipients:
+            await edit(app, press, "Некому отправить: подписчиков пока нет.")
+            return
+        await edit(app, press, f"🚀 Рассылка запущена: получателей {len(recipients)}. Отчёт пришлю в конце.")
+        start_background(
+            run_broadcast(
+                app,
+                admin_chat_id=press.user_id,
+                source_message_id=flow.source_message_id,
+                markup=flow.markup,
+                recipients=recipients,
+            )
+        )
 
 
-# ---------------------------------------------------------------- обработчики пользователей
-
-
-async def popup_pressed(callback: CallbackQuery, db: Database) -> None:
-    """Нажата кнопка «popup»: показываем всплывающее окно с заданным текстом."""
-    popup_id = popup_id_from_callback(callback.data)
-    text = db.get_popup(popup_id) if popup_id is not None else None
+async def popup_pressed(app: App, press: IncomingPress) -> None:
+    """Нажата popup-кнопка: показываем всплывающее окно с заданным текстом."""
+    popup_id = popup_id_from_callback(press.data)
+    text = app.db.get_popup(popup_id) if popup_id is not None else None
     if text is None:
-        await _answer_callback(callback, POPUP_MISSING, show_alert=True)
+        await answer(app, press, POPUP_MISSING, alert=True)
     else:
-        await _answer_callback(callback, text, show_alert=True)
+        await answer(app, press, text, alert=True)
 
 
-async def cmd_start(message: Message, db: Database, config: Config) -> None:
-    user = message.from_user
-    db.subscribe(user.id, user.username, user.first_name)
-    if user.id in config.admin_ids:
-        await message.answer(ADMIN_GREETING + ADMIN_HELP)
-    else:
-        await message.answer(USER_GREETING)
+async def handle_press(app: App, press: IncomingPress) -> None:
+    data = press.data or ""
+    if is_admin(app, press.user_id) and data.startswith("post:"):
+        flow = app.flows.get(press.user_id)
+        if flow is not None and flow.step == "choose" and data in DECISIONS:
+            await handle_decision(app, press, flow, data)
+        else:
+            await answer(app, press, STALE, alert=True)  # пост уже неактуален
+    elif data.startswith("pp:"):
+        await popup_pressed(app, press)
 
 
-async def cmd_stop(message: Message, db: Database) -> None:
-    db.set_subscribed(message.from_user.id, False)
-    await message.answer(STOPPED)
-
-
-async def cmd_id(message: Message) -> None:
-    await message.answer(f"Ваш ID: {message.from_user.id}")
-
-
-async def cmd_help(message: Message, config: Config) -> None:
-    await message.answer(ADMIN_HELP if message.from_user.id in config.admin_ids else USER_HINT)
-
-
-async def fallback(message: Message, config: Config) -> None:
-    if message.from_user.id in config.admin_ids:
-        await message.answer(UNKNOWN_COMMAND)
-    else:
-        await message.answer(USER_HINT)
+async def handle_update(app: App, update: dict[str, Any]) -> None:
+    if "message" in update:
+        await handle_message(app, parse_message(update["message"]))
+    elif "callback_query" in update:
+        await handle_press(app, parse_press(update["callback_query"]))
 
 
 # ---------------------------------------------------------------- рассылка
@@ -457,40 +499,41 @@ class Delivery:
 
 
 async def copy_to(
-    bot: Bot,
+    api: Any,
     chat_id: int,
     source_chat_id: int,
     source_message_id: int,
-    markup: InlineKeyboardMarkup | None,
+    markup: dict[str, Any] | None,
 ) -> Delivery:
     """Скопировать пост в чат chat_id вместе с кнопками.
 
-    copy_message сохраняет форматирование и медиа, но не показывает «переслано от».
+    copyMessage сохраняет форматирование и медиа, но не показывает «переслано от».
     При лимитах Telegram и сетевых сбоях попытку повторяем.
     """
     for _ in range(MAX_ATTEMPTS):
         try:
-            await bot.copy_message(
+            await api.call(
+                "copyMessage",
                 chat_id=chat_id,
                 from_chat_id=source_chat_id,
                 message_id=source_message_id,
                 reply_markup=markup,
             )
             return Delivery(Outcome.SENT)
-        except TelegramRetryAfter as exc:
+        except RetryAfterError as exc:
             logger.warning("Telegram просит подождать %s сек.", exc.retry_after)
             await asyncio.sleep(exc.retry_after + 1)
-        except TelegramNetworkError:
+        except NetworkError:
             logger.warning("Сетевая ошибка при отправке, повторяю")
             await asyncio.sleep(2)
-        except TelegramForbiddenError:
+        except ForbiddenError:
             return Delivery(Outcome.BLOCKED, "пользователь заблокировал бота или не нажимал /start")
-        except TelegramBadRequest as exc:
-            if "chat not found" in exc.message.lower():
+        except BadRequestError as exc:
+            if "chat not found" in exc.description.lower():
                 return Delivery(Outcome.BLOCKED, "пользователь не нажимал /start")
-            return Delivery(Outcome.FAILED, exc.message)
-        except TelegramAPIError as exc:
-            return Delivery(Outcome.FAILED, exc.message)
+            return Delivery(Outcome.FAILED, exc.description)
+        except TelegramError as exc:
+            return Delivery(Outcome.FAILED, exc.description)
     return Delivery(Outcome.FAILED, "Telegram не ответил после нескольких попыток")
 
 
@@ -527,19 +570,18 @@ class BroadcastReport:
 
 
 async def run_broadcast(
-    bot: Bot,
-    db: Database,
+    app: App,
     *,
     admin_chat_id: int,
     source_message_id: int,
-    markup: InlineKeyboardMarkup | None,
+    markup: dict[str, Any] | None,
     recipients: list[int],
 ) -> None:
     report = BroadcastReport(total=len(recipients))
     errors_in_row = 0
     for user_id in recipients:
-        delivery = await copy_to(bot, user_id, admin_chat_id, source_message_id, markup)
-        apply_outcome(db, user_id, delivery)
+        delivery = await copy_to(app.api, user_id, admin_chat_id, source_message_id, markup)
+        apply_outcome(app.db, user_id, delivery)
         if delivery.outcome is Outcome.SENT:
             report.sent += 1
             errors_in_row = 0
@@ -555,13 +597,13 @@ async def run_broadcast(
                 break
         await asyncio.sleep(SEND_INTERVAL)
     logger.info("Рассылка: доставлено %d из %d", report.sent, report.total)
-    await bot.send_message(admin_chat_id, report.render())
+    await send(app, admin_chat_id, report.render())
 
 
 _background_tasks: set[asyncio.Task] = set()
 
 
-def start_background(coro: Coroutine[Any, Any, Any]) -> None:
+def start_background(coro: Any) -> None:
     """Запустить рассылку в фоне, чтобы бот продолжал отвечать на другие сообщения."""
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
@@ -580,74 +622,76 @@ async def wait_for_background() -> None:
         await asyncio.gather(*list(_background_tasks), return_exceptions=True)
 
 
-# ---------------------------------------------------------------- сборка и запуск
+# ---------------------------------------------------------------- получение обновлений и запуск
 
 
-def build_admin_router() -> Router:
-    router = Router(name="admin")
-    router.message.filter(F.chat.type == ChatType.PRIVATE, IsAdmin())
-    router.callback_query.filter(IsAdmin())
-    router.message.register(cmd_cancel, Command("cancel"))
-    router.message.register(cmd_stats, Command("stats"))
-    router.message.register(skip_buttons, Command("skip"), PostFlow.buttons)
-    router.message.register(buttons_received, PostFlow.buttons, F.text, NotCommand())
-    router.message.register(buttons_hint, PostFlow.buttons, NotCommand())
-    router.message.register(target_received, PostFlow.target, F.text, NotCommand())
-    router.message.register(target_hint, PostFlow.target, NotCommand())
-    router.message.register(choose_hint, PostFlow.choose, NotCommand())
-    router.message.register(draft_received, StateFilter(None), NotCommand())
-    router.callback_query.register(choose_all, PostFlow.choose, F.data == "post:all")
-    router.callback_query.register(choose_one, PostFlow.choose, F.data == "post:one")
-    router.callback_query.register(choose_cancel, PostFlow.choose, F.data == "post:cancel")
-    router.callback_query.register(stale_post, CallbackPrefix("post:"))
-    return router
+async def clear_webhook(api: TelegramAPI) -> None:
+    """Отключить webhook: при long polling он мешает. Сетевые сбои повторяем, а не падаем."""
+    delay = 1.0
+    while True:
+        try:
+            await api.call("deleteWebhook")
+            return
+        except NetworkError:
+            logger.warning("Нет связи с Telegram, повторю через %s с", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
 
 
-def build_popup_router() -> Router:
-    router = Router(name="popup")
-    router.callback_query.register(popup_pressed, CallbackPrefix("pp:"))
-    return router
-
-
-def build_user_router() -> Router:
-    router = Router(name="user")
-    router.message.filter(F.chat.type == ChatType.PRIVATE)
-    router.message.register(cmd_start, Command("start"))
-    router.message.register(cmd_stop, Command("stop"))
-    router.message.register(cmd_id, Command("id"))
-    router.message.register(cmd_help, Command("help"))
-    router.message.register(fallback)
-    return router
-
-
-def create_dispatcher(config: Config, db: Database) -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage())
-    dp["config"] = config
-    dp["db"] = db
-    dp["decision_lock"] = asyncio.Lock()
-    dp.message.outer_middleware(TrackUserMiddleware())
-    dp.include_router(build_admin_router())
-    dp.include_router(build_popup_router())
-    dp.include_router(build_user_router())
-    return dp
+async def poll(app: App) -> None:
+    """Получать обновления через getUpdates и передавать их обработчикам."""
+    offset: int | None = None
+    delay = 1.0
+    while True:
+        try:
+            updates = await app.api.call(
+                "getUpdates",
+                offset=offset,
+                timeout=POLL_TIMEOUT,
+                allowed_updates=["message", "callback_query"],
+                http_timeout=POLL_TIMEOUT + 20,
+            )
+            delay = 1.0
+        except UnauthorizedError:
+            raise  # токен неверен: повторять бессмысленно
+        except RetryAfterError as exc:
+            await asyncio.sleep(exc.retry_after)
+            continue
+        except ConflictError:
+            logger.error("Этот токен уже используется другим запущенным экземпляром бота.")
+            await asyncio.sleep(15)
+            continue
+        except TelegramError as exc:
+            logger.warning("Ошибка связи с Telegram: %s. Повторю через %s с.", exc.description, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+            continue
+        for update in updates:
+            offset = update["update_id"] + 1  # сдвигаем offset до обработки, чтобы сбойное обновление не зацикливалось
+            try:
+                await handle_update(app, update)
+            except TelegramError as exc:
+                logger.warning("Telegram отклонил действие: %s", exc.description)
+            except Exception:  # один сбой не должен останавливать бота
+                logger.exception("Не удалось обработать обновление")
 
 
 async def run(config: Config) -> None:
     db = Database(config.db_path)
-    bot = Bot(token=config.token)
-    dp = create_dispatcher(config, db)
+    api = TelegramAPI(config.token)
+    app = App(config=config, db=db, api=api)
     if not config.admin_ids:
         logger.warning(
             "ADMIN_IDS не задан: админ-функции отключены. "
             "Напиши боту /id и добавь полученное число в ADMIN_IDS."
         )
     try:
-        await bot.delete_webhook()  # polling не работает, пока включён webhook
+        await clear_webhook(api)
         logger.info("Бот запущен. База данных: %s", config.db_path)
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await poll(app)
     finally:
+        await api.close()
         db.close()
-        await bot.session.close()
 
 
 def main() -> None:
@@ -659,7 +703,16 @@ def main() -> None:
     except ConfigError as exc:
         logger.error("%s", exc)
         sys.exit(1)
-    asyncio.run(run(config))
+    try:
+        asyncio.run(run(config))
+    except UnauthorizedError:
+        logger.error(
+            "Telegram не принял токен (ошибка 401). Проверь TELEGRAM_BOT_TOKEN: "
+            "он мог быть задан с ошибкой или перевыпущен в @BotFather."
+        )
+        sys.exit(1)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

@@ -1,25 +1,16 @@
 """Сценарии бота целиком: команды, создание поста, предпросмотр, рассылка.
 
-Сеть не трогаем: FakeSession запоминает вызовы Bot API и отвечает заглушками.
+Сеть не трогаем: FakeAPI запоминает вызовы Bot API и отвечает заглушками.
 """
 
 import logging
 import tempfile
 import unittest
-from datetime import datetime
 from pathlib import Path
-
-from aiogram import Bot
-from aiogram.client.session.base import BaseSession
-from aiogram.exceptions import (
-    TelegramBadRequest,
-    TelegramForbiddenError,
-    TelegramRetryAfter,
-)
-from aiogram.types import Chat, Message, MessageId, Update
 
 import main
 from db import Database
+from telegram_api import BadRequestError, ForbiddenError, RetryAfterError
 
 ADMIN = 1
 ALICE = 10
@@ -27,57 +18,79 @@ BOB = 11
 CAROL = 12  # эта подписчица заблокирует бота
 
 
-class FakeSession(BaseSession):
+class FakeAPI:
+    """Подставка вместо TelegramAPI: записывает вызовы и отвечает заглушками."""
+
     def __init__(self) -> None:
-        super().__init__()
-        self.calls: list = []
+        self.calls: list[tuple[str, dict]] = []
         self.blocked: set[int] = set()  # чаты, где бота заблокировали навсегда
-        # chat_id -> по одной функции на каждую попытку; каждая создаёт ошибку Telegram
-        self.copy_errors: dict[int, list] = {}
-        self.fail_answer = False  # отвечать на нажатия кнопок с ошибкой «query is too old»
+        self.copy_errors: dict[int, list] = {}  # chat_id -> ошибки по очереди для copyMessage
+        self.fail_answer = False  # отвечать на нажатия с ошибкой «query is too old»
         self._counter = 1000
 
-    async def make_request(self, bot, method, timeout=None):
-        name = method.__api_method__
-        self.calls.append(method)
-        if name == "copyMessage":
-            if method.chat_id in self.blocked:
-                raise TelegramForbiddenError(
-                    method=method, message="Forbidden: bot was blocked by the user"
-                )
-            queue = self.copy_errors.get(method.chat_id)
+    async def call(self, method: str, *, http_timeout: float = 30, **params):
+        payload = {key: value for key, value in params.items() if value is not None}
+        self.calls.append((method, payload))
+        if method == "copyMessage":
+            chat_id = payload["chat_id"]
+            if chat_id in self.blocked:
+                raise ForbiddenError("Forbidden: bot was blocked by the user", 403)
+            queue = self.copy_errors.get(chat_id)
             if queue:
-                raise queue.pop(0)(method)
-            self._counter += 1
-            return MessageId(message_id=self._counter)
-        if name == "answerCallbackQuery" and self.fail_answer:
-            raise TelegramBadRequest(
-                method=method,
-                message="query is too old and response timeout expired or query id is invalid",
-            )
-        if name == "sendMessage":
-            self._counter += 1
-            return Message(
-                message_id=self._counter,
-                date=datetime.now(),
-                chat=Chat(id=method.chat_id, type="private"),
-            )
-        return True  # answerCallbackQuery, editMessageText и прочее: результат не нужен
+                raise queue.pop(0)
+            return {"message_id": self._next_id()}
+        if method == "sendMessage":
+            return {
+                "message_id": self._next_id(),
+                "date": 0,
+                "chat": {"id": payload["chat_id"], "type": "private"},
+            }
+        if method == "answerCallbackQuery" and self.fail_answer:
+            raise BadRequestError("Bad Request: query is too old", 400)
+        return True
+
+    def _next_id(self) -> int:
+        self._counter += 1
+        return self._counter
 
     async def close(self) -> None:
         pass
-
-    async def stream_content(self, url, headers=None, timeout=30, chunk_size=65536, raise_for_status=True):
-        raise NotImplementedError("файлы в тестах не скачиваем")
-        yield b""  # pragma: no cover — делает функцию генератором
 
 
 def _user(user_id: int, name: str) -> dict:
     return {"id": user_id, "is_bot": False, "first_name": name, "username": name.lower()}
 
 
-def _chat(user_id: int, name: str) -> dict:
-    return {"id": user_id, "type": "private", "first_name": name}
+def message_update(update_id, user_id, name, text=None, *, message_id=1, photo=False) -> dict:
+    message = {
+        "message_id": message_id,
+        "date": 1_700_000_000,
+        "chat": {"id": user_id, "type": "private", "first_name": name},
+        "from": _user(user_id, name),
+    }
+    if text is not None:
+        message["text"] = text
+    if photo:
+        message["photo"] = [{"file_id": "f", "file_unique_id": "u", "width": 10, "height": 10}]
+    return {"update_id": update_id, "message": message}
+
+
+def press_update(update_id, user_id, name, data) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb{update_id}",
+            "from": _user(user_id, name),
+            "chat_instance": "ci",
+            "data": data,
+            "message": {
+                "message_id": 500 + update_id,
+                "date": 1_700_000_000,
+                "chat": {"id": user_id, "type": "private", "first_name": name},
+                "text": "решение",
+            },
+        },
+    }
 
 
 class BotFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -90,16 +103,12 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         db_path = Path(self.tmp.name) / "bot.db"
         self.db = Database(db_path)
-        self.config = main.Config(
-            token="123456:TEST", admin_ids=frozenset({ADMIN}), db_path=db_path
-        )
-        self.session = FakeSession()
-        self.bot = Bot(token="123456:TEST", session=self.session)
-        self.dp = main.create_dispatcher(self.config, self.db)
+        self.config = main.Config(token="123456:TEST", admin_ids=frozenset({ADMIN}), db_path=db_path)
+        self.api = FakeAPI()
+        self.app = main.App(config=self.config, db=self.db, api=self.api)
         self.update_id = 0
 
     async def asyncTearDown(self) -> None:
-        await self.bot.session.close()
         self.db.close()
         self.tmp.cleanup()
         main.SEND_INTERVAL = self._saved_interval
@@ -107,58 +116,23 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
 
     # ---------- помощники
 
-    async def message(
-        self,
-        user_id: int,
-        name: str,
-        text: str | None = None,
-        *,
-        message_id: int = 1,
-        photo: bool = False,
-    ) -> None:
+    async def message(self, user_id, name, text=None, *, message_id=1, photo=False) -> None:
         self.update_id += 1
-        payload: dict = {
-            "message_id": message_id,
-            "date": 1_700_000_000,
-            "chat": _chat(user_id, name),
-            "from": _user(user_id, name),
-        }
-        if text is not None:
-            payload["text"] = text
-        if photo:
-            payload["photo"] = [{"file_id": "f", "file_unique_id": "u", "width": 10, "height": 10}]
-        update = Update.model_validate({"update_id": self.update_id, "message": payload})
-        await self.dp.feed_update(self.bot, update)
+        update = message_update(self.update_id, user_id, name, text, message_id=message_id, photo=photo)
+        await main.handle_update(self.app, update)
 
-    async def press(self, user_id: int, name: str, data: str) -> None:
+    async def press(self, user_id, name, data) -> None:
         self.update_id += 1
-        update = Update.model_validate(
-            {
-                "update_id": self.update_id,
-                "callback_query": {
-                    "id": f"cb{self.update_id}",
-                    "from": _user(user_id, name),
-                    "chat_instance": "ci",
-                    "data": data,
-                    "message": {
-                        "message_id": 500 + self.update_id,
-                        "date": 1_700_000_000,
-                        "chat": _chat(user_id, name),
-                        "text": "решение",
-                    },
-                },
-            }
-        )
-        await self.dp.feed_update(self.bot, update)
+        await main.handle_update(self.app, press_update(self.update_id, user_id, name, data))
 
-    def calls(self, method_name: str) -> list:
-        return [c for c in self.session.calls if c.__api_method__ == method_name]
+    def calls(self, method: str) -> list[dict]:
+        return [payload for name, payload in self.api.calls if name == method]
 
     def texts_to(self, chat_id: int) -> list[str]:
-        return [c.text for c in self.calls("sendMessage") if c.chat_id == chat_id]
+        return [payload["text"] for payload in self.calls("sendMessage") if payload["chat_id"] == chat_id]
 
-    def copies_to_users(self) -> list:
-        return [c for c in self.calls("copyMessage") if c.chat_id != ADMIN]
+    def copies_to_users(self) -> list[dict]:
+        return [payload for payload in self.calls("copyMessage") if payload["chat_id"] != ADMIN]
 
     async def register_subscribers(self) -> None:
         await self.message(ALICE, "alice", "/start")
@@ -169,30 +143,32 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_broadcast_with_url_buttons(self):
         await self.register_subscribers()
-        self.session.blocked.add(CAROL)
+        self.api.blocked.add(CAROL)
 
         await self.message(ADMIN, "admin", "/start")
         await self.message(ADMIN, "admin", "Привет всем!", message_id=50)
-        await self.message(
-            ADMIN, "admin", "Сайт - https://example.com | Поддержка - https://t.me/support"
-        )
+        await self.message(ADMIN, "admin", "Сайт - https://example.com | Поддержка - https://t.me/support")
 
         # Предпросмотр: копия поста админу с кнопками и вопрос про получателей.
         preview = self.calls("copyMessage")[-1]
-        self.assertEqual((preview.chat_id, preview.from_chat_id, preview.message_id), (ADMIN, ADMIN, 50))
-        first_row = preview.reply_markup.inline_keyboard[0]
-        self.assertEqual([(b.text, b.url) for b in first_row],
-                         [("Сайт", "https://example.com"), ("Поддержка", "https://t.me/support")])
+        self.assertEqual(
+            (preview["chat_id"], preview["from_chat_id"], preview["message_id"]), (ADMIN, ADMIN, 50)
+        )
+        first_row = preview["reply_markup"]["inline_keyboard"][0]
+        self.assertEqual(
+            [(b["text"], b["url"]) for b in first_row],
+            [("Сайт", "https://example.com"), ("Поддержка", "https://t.me/support")],
+        )
         self.assertTrue(any("Кому отправить" in t for t in self.texts_to(ADMIN)))
 
         await self.press(ADMIN, "admin", "post:all")
         await main.wait_for_background()
 
         copies = self.copies_to_users()
-        self.assertEqual(sorted(c.chat_id for c in copies), [ALICE, BOB, CAROL])
+        self.assertEqual(sorted(c["chat_id"] for c in copies), [ALICE, BOB, CAROL])
         for copy in copies:
-            self.assertEqual((copy.from_chat_id, copy.message_id), (ADMIN, 50))
-            self.assertEqual(copy.reply_markup.inline_keyboard[0][0].url, "https://example.com")
+            self.assertEqual((copy["from_chat_id"], copy["message_id"]), (ADMIN, 50))
+            self.assertEqual(copy["reply_markup"]["inline_keyboard"][0][0]["url"], "https://example.com")
 
         self.assertFalse(self.db.get_user(CAROL).subscribed)  # заблокировала — отписана
         self.assertTrue(self.db.get_user(ALICE).subscribed)
@@ -212,9 +188,9 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         await main.wait_for_background()
 
         copies = self.copies_to_users()
-        self.assertEqual([c.chat_id for c in copies], [ALICE])
-        self.assertEqual(copies[0].message_id, 95)
-        self.assertIsNone(copies[0].reply_markup)
+        self.assertEqual([c["chat_id"] for c in copies], [ALICE])
+        self.assertEqual(copies[0]["message_id"], 95)
+        self.assertNotIn("reply_markup", copies[0])  # без кнопок параметр не отправляется
 
     async def test_popup_button_shows_alert(self):
         await self.message(ALICE, "alice", "/start")
@@ -222,16 +198,16 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.message(ADMIN, "admin", "Подробнее - popup: Текст всплывающего окна")
 
         preview = self.calls("copyMessage")[-1]
-        self.assertEqual(preview.reply_markup.inline_keyboard[0][0].callback_data, "pp:1")
+        self.assertEqual(preview["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "pp:1")
 
         await self.press(ADMIN, "admin", "post:cancel")
         self.assertEqual(self.copies_to_users(), [])
-        self.assertEqual(self.calls("copyMessage")[-1].chat_id, ADMIN)  # только предпросмотр
+        self.assertEqual(self.calls("copyMessage")[-1]["chat_id"], ADMIN)  # только предпросмотр
 
         await self.press(ALICE, "alice", "pp:1")
         answer = self.calls("answerCallbackQuery")[-1]
-        self.assertEqual(answer.text, "Текст всплывающего окна")
-        self.assertTrue(answer.show_alert)
+        self.assertEqual(answer["text"], "Текст всплывающего окна")
+        self.assertTrue(answer["show_alert"])
 
     async def test_send_to_one_user_by_username(self):
         await self.message(ALICE, "alice", "/start")
@@ -243,10 +219,9 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Не нашёл такого пользователя", self.texts_to(ADMIN)[-1])
 
         await self.message(ADMIN, "admin", "@Alice")
-        await main.wait_for_background()
         copies = self.copies_to_users()
-        self.assertEqual([c.chat_id for c in copies], [ALICE])
-        self.assertIsNone(copies[0].reply_markup)
+        self.assertEqual([c["chat_id"] for c in copies], [ALICE])
+        self.assertNotIn("reply_markup", copies[0])
         self.assertEqual(self.texts_to(ADMIN)[-1], "✅ Отправлено: @Alice.")
 
     async def test_unsubscribed_user_is_not_targeted(self):
@@ -267,7 +242,7 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.message(ADMIN, "admin", "/skip")
         await self.press(ADMIN, "admin", "post:all")
         await main.wait_for_background()
-        self.assertEqual({c.chat_id for c in self.copies_to_users()}, {ALICE})
+        self.assertEqual({c["chat_id"] for c in self.copies_to_users()}, {ALICE})
 
     async def test_invalid_buttons_keep_draft_and_cancel_works(self):
         await self.message(ADMIN, "admin", "Пост", message_id=90)
@@ -296,38 +271,37 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         await main.wait_for_background()
         self.assertEqual(len(self.copies_to_users()), 1)
         stale = self.calls("answerCallbackQuery")[-1]
-        self.assertEqual(stale.text, main.STALE)
-        self.assertTrue(stale.show_alert)
+        self.assertEqual(stale["text"], main.STALE)
+        self.assertTrue(stale["show_alert"])
 
     async def test_failed_button_answer_does_not_block_broadcast(self):
         await self.message(ALICE, "alice", "/start")
         await self.message(ADMIN, "admin", "Пост", message_id=110)
         await self.message(ADMIN, "admin", "/skip")
-        self.session.fail_answer = True  # Telegram не принимает ответ на нажатие
+        self.api.fail_answer = True  # Telegram не принимает ответ на нажатие
         await self.press(ADMIN, "admin", "post:all")
         await main.wait_for_background()
-        self.assertEqual([c.chat_id for c in self.copies_to_users()], [ALICE])
+        self.assertEqual([c["chat_id"] for c in self.copies_to_users()], [ALICE])
         self.assertIn("Доставлено: 1", self.texts_to(ADMIN)[-1])
 
     async def test_retry_after_is_retried(self):
         await self.message(ALICE, "alice", "/start")
         await self.message(ADMIN, "admin", "Пост", message_id=120)
         await self.message(ADMIN, "admin", "/skip")
-        self.session.copy_errors[ALICE] = [
-            lambda m: TelegramRetryAfter(method=m, message="Too Many Requests", retry_after=0)
-        ]
+        self.api.copy_errors[ALICE] = [RetryAfterError("Too Many Requests", 0)]
         await self.press(ADMIN, "admin", "post:all")
         await main.wait_for_background()
-        alice_attempts = [c for c in self.copies_to_users() if c.chat_id == ALICE]
+        alice_attempts = [c for c in self.copies_to_users() if c["chat_id"] == ALICE]
         self.assertEqual(len(alice_attempts), 2)  # первая попытка — лимит, вторая — успех
         self.assertIn("Доставлено: 1", self.texts_to(ADMIN)[-1])
 
     async def test_broadcast_stops_after_many_errors(self):
         for user_id, name in ((ALICE, "alice"), (BOB, "bob"), (CAROL, "carol")):
             await self.message(user_id, name, "/start")
-        bad = lambda m: TelegramBadRequest(method=m, message="wrong file identifier")  # noqa: E731
         for user_id in (ALICE, BOB, CAROL):
-            self.session.copy_errors[user_id] = [bad, bad, bad]
+            self.api.copy_errors[user_id] = [
+                BadRequestError("Bad Request: wrong file identifier", 400) for _ in range(3)
+            ]
         await self.message(ADMIN, "admin", "Пост", message_id=130)
         await self.message(ADMIN, "admin", "/skip")
         old_limit = main.ABORT_AFTER_ERRORS
@@ -347,6 +321,13 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.texts_to(ALICE)[-1], f"Ваш ID: {ALICE}")
         await self.message(ALICE, "alice", "/start")
         self.assertEqual(self.texts_to(ALICE)[-1], main.USER_GREETING)
+
+    async def test_group_messages_are_ignored(self):
+        update = message_update(1, ALICE, "alice", "/start")
+        update["message"]["chat"]["type"] = "group"
+        await main.handle_update(self.app, update)
+        self.assertEqual(self.api.calls, [])
+        self.assertIsNone(self.db.get_user(ALICE))
 
 
 if __name__ == "__main__":
