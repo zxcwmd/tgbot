@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tgbot",
+  "main": "worker/index.mjs",
+  "compatibility_date": "2026-11-25",
+  "workers_dev": true,
+  "keep_vars": true,
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "tgbot",
+    "database_id": "175d0902-0005-4d91-87e4-cbdb0a5dea7b"
+  }],
+  "triggers": { "crons": ["*/5 * * * *"] }
+}
