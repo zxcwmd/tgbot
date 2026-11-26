@@ -133,6 +133,17 @@ def deliver(db):
             db.execute('UPDATE orders SET delivered=1 WHERE id=?', (order['id'],))
 
 
+def configure_polling(remove_webhook=False):
+    """Switch transports only when explicitly authorized, preserving queued updates."""
+    if not api('getWebhookInfo').get('url'):
+        return
+    if not remove_webhook:
+        raise SystemExit('У бота активен webhook. Для переноса задайте SWITCH_TO_POLLING=1 и перезапустите.')
+    if not api('deleteWebhook', drop_pending_updates=False):
+        raise TelegramError('Telegram не подтвердил отключение webhook')
+    logging.info('Webhook отключён; ожидающие обновления сохранены.')
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     for key in ('BOT_TOKEN', 'ADMIN_ID', 'SUPPORT_CONTACT'):
@@ -140,6 +151,18 @@ def main():
             raise SystemExit(f'Укажите {key}')
     admin = int(os.environ['ADMIN_ID'])
     db = open_db(os.environ.get('DB_PATH', 'data/shop.sqlite3'))
+    while True:
+        try:
+            configure_polling(os.environ.get('SWITCH_TO_POLLING') == '1')
+            break
+        except TelegramError as error:
+            if str(error).endswith((' 401', ' 404')):
+                raise SystemExit('Telegram не принял BOT_TOKEN. Проверьте токен.') from None
+            logging.warning('Не удалось проверить webhook; повтор через 5 секунд')
+        except (OSError, ValueError):
+            logging.warning('Telegram недоступен; повтор через 5 секунд')
+        time.sleep(5)
+    logging.info('Бот запущен в режиме long polling.')
     offset = 0
     while True:
         try:
@@ -154,7 +177,12 @@ def main():
                     logging.warning('%s (update %s)', error, update['update_id'])
                 offset = update['update_id'] + 1
             deliver(db)
-        except (TelegramError, OSError, ValueError):
+        except TelegramError as error:
+            if str(error) == 'getUpdates: Telegram error 409':
+                raise SystemExit('Конфликт Telegram: проверьте webhook и остановите другие экземпляры бота.') from None
+            logging.warning('%s; повтор через 5 секунд', error)
+            time.sleep(5)
+        except (OSError, ValueError):
             logging.warning('Сбой связи с Telegram; повтор через 5 секунд')
             time.sleep(5)
 
